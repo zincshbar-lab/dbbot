@@ -1,11 +1,12 @@
 import { type NearRpc, type TxResult } from './near/rpc.js'
-import type { HotSigner } from './near/signer.js'
+import type { HotSigner, PlannedTx } from './near/signer.js'
 import type { Router } from './near/router.js'
 import type { Store, Position } from './store.js'
 import { Gaypad, JAMBO, isGaypadToken, type SwapState } from './gaypad/contract.js'
 import { Shards, WRAP, isShardsToken } from './shards/contract.js'
 import { CHIPFI_STORAGE, Chipfi, isChipfiToken } from './chipfi/contract.js'
 import { Umbra, isUmbraToken } from './umbra/contract.js'
+import { isNearlyToken, nearlyInfo } from './nearly/contract.js'
 import { MemeCooking } from './memecooking/contract.js'
 import { ftBalance, ftMetadata, registrationTxs, type FtMetadata } from './near/tokens.js'
 import { ONE_NEAR, applyBps, formatNear, minusBps, mulDiv } from './lib/amounts.js'
@@ -21,7 +22,7 @@ export class TradeError extends Error {
   }
 }
 
-export type Venue = 'curve' | 'dex' | 'shards' | 'chipfi' | 'umbra'
+export type Venue = 'curve' | 'dex' | 'shards' | 'chipfi' | 'umbra' | 'nearly'
 
 export interface TokenView {
   tokenId: string
@@ -224,7 +225,10 @@ export class Trader {
    */
   async priceNear(tokenId: string, decimals: number): Promise<number | null> {
     try {
-      if (isShardsToken(tokenId)) {
+      if (isNearlyToken(tokenId)) {
+        const info = await nearlyInfo(tokenId)
+        if (info && info.priceNear > 0) return info.priceNear
+      } else if (isShardsToken(tokenId)) {
         const st = await this.rpc.view<any>(tokenId, 'get_state', {}, 'optimistic')
         const [q, t] = st.phase === 'live_amm' ? [st.pool_quote, st.pool_token] : [st.virtual_quote, st.virtual_token]
         const cfg = await this.shards.config(tokenId)
@@ -313,6 +317,7 @@ export class Trader {
   }
 
   async venueOf(tokenId: string): Promise<{ venue: Venue; state: SwapState | null }> {
+    if (isNearlyToken(tokenId)) return { venue: 'nearly', state: null }
     if (isShardsToken(tokenId)) return { venue: 'shards', state: null }
     if (isUmbraToken(tokenId)) {
       const c = await this.umbra.curve(tokenId).catch(() => null)
@@ -346,7 +351,14 @@ export class Trader {
         if (Chipfi.drained(await this.chipfi.info(tokenId))) return 0n
         return await this.chipfi.quoteSell(tokenId, amount)
       }
-      if (venue === 'umbra') return Umbra.quoteSell(await this.umbra.curve(tokenId), amount)
+      if (venue === 'umbra') {
+        const c = await this.umbra.curve(tokenId)
+        const q = Umbra.quoteSell(c, amount)
+        if (q === null || Umbra.pairedWithNear(c)) return q
+        // Stock-quoted: value the stock-token proceeds back in NEAR.
+        const r = await this.router.best({ tokenIn: c.quote_token!, tokenOut: 'near', amountIn: q, slippageBps: 100, trader: this.me })
+        return r?.estimatedOut ?? null
+      }
       if (venue === 'shards') {
         const cfg = await this.shards.config(tokenId)
         if (cfg.quote_asset_id !== WRAP) return null
@@ -359,6 +371,21 @@ export class Trader {
         const probe = 10n ** 21n
         const spot = await this.gaypad.emulate(JAMBO, tokenId, probe)
         return spot?.amountOut ? this.jamboInNear(mulDiv(amount, probe, spot.amountOut)) : null
+      }
+      if (venue === 'nearly') {
+        const info = await nearlyInfo(tokenId)
+        if (info && !info.quoteIsNear) {
+          // Two hops: token → quote → NEAR, estimated only (no transaction).
+          const r1 = await this.router.best({ tokenIn: tokenId, tokenOut: info.quote, amountIn: amount, slippageBps: 100, trader: this.me })
+          if (r1?.estimatedOut) {
+            const r2 = await this.router.best({ tokenIn: info.quote, tokenOut: 'near', amountIn: r1.estimatedOut, slippageBps: 100, trader: this.me })
+            if (r2) return r2.estimatedOut
+          }
+          // Fall back to nearly.trade's own price.
+          const meta = await ftMetadata(this.rpc, tokenId)
+          return info.priceNear > 0 ? BigInt(Math.round(info.priceNear * (Number(amount) / 10 ** meta.decimals) * 1e24)) : null
+        }
+        // NEAR-quoted: a single router hop.
       }
       const route = await this.router.best({ tokenIn: tokenId, tokenOut: 'near', amountIn: amount, slippageBps: 100, trader: this.me })
       return route?.estimatedOut ?? null
@@ -575,15 +602,95 @@ export class Trader {
     if (venue === 'shards') return this.buyShards(tokenId, nearAmount)
     if (venue === 'chipfi') return this.buyChipfi(tokenId, nearAmount)
     if (venue === 'umbra') return this.buyUmbra(tokenId, nearAmount)
+    if (venue === 'nearly') return this.buyNearly(tokenId, nearAmount)
     return this.buyDex(tokenId, nearAmount)
+  }
+
+  // Storage registrations already satisfied this session — so repeat trades
+  // don't re-send the same storage_deposit and pay the round trip again.
+  private readonly registered = new Set<string>()
+
+  private isStorageDeposit(tx: PlannedTx): boolean {
+    return tx.actions.length === 1 && (tx.actions[0] as unknown as { functionCall?: { methodName?: string } }).functionCall?.methodName === 'storage_deposit'
+  }
+
+  /**
+   * Sends a router's transactions, but first drops any storage_deposit that is
+   * already done (checked in parallel, read-only). This is the main speed win:
+   * a repeat buy on a token you already hold sends only the swap. The swap is
+   * fast-broadcast to every RPC at once.
+   */
+  private async sendRoute(txs: PlannedTx[]): Promise<TxResult[]> {
+    const needed = await Promise.all(
+      txs.map(async (tx) => {
+        if (!this.isStorageDeposit(tx)) return true
+        if (this.registered.has(tx.receiverId)) return false
+        const reg = await this.rpc.view<unknown>(tx.receiverId, 'storage_balance_of', { account_id: this.me }).catch(() => 'unknown')
+        if (reg !== null) {
+          this.registered.add(tx.receiverId) // registered, or no storage mgmt — either way skip
+          return false
+        }
+        return true
+      }),
+    )
+    const filtered = txs.filter((_, i) => needed[i])
+    const results: TxResult[] = []
+    for (const tx of filtered) {
+      results.push(await this.signer.send(tx, { fast: true }))
+      if (this.isStorageDeposit(tx)) this.registered.add(tx.receiverId)
+    }
+    return results
+  }
+
+  /**
+   * One router swap, sent and measured. `out` is the actual amount received
+   * (native NEAR is measured net of gas; a token by its balance delta).
+   */
+  private async routerSwap(tokenIn: string, tokenOut: string, amountIn: bigint): Promise<{ hash: string; out: bigint }> {
+    const slip = this.store.state.settings.slippageBps
+    const route = await this.router.best({ tokenIn, tokenOut, amountIn, slippageBps: slip, trader: this.me })
+    const nameOf = (t: string) => (t === 'near' ? 'NEAR' : (t.split('.')[0] ?? t))
+    if (!route) throw new TradeError(`no route ${nameOf(tokenIn)} → ${nameOf(tokenOut)} (liquidity too thin?)`)
+    if (tokenOut === 'near') {
+      const before = await this.nearBalance()
+      const results = await this.sendRoute(route.txs)
+      const got = await this.nearReceived(before)
+      return { hash: lastHash(results), out: got > 0n ? got : route.estimatedOut }
+    }
+    const before = await ftBalance(this.rpc, tokenOut, this.me, 'freshest')
+    const results = await this.sendRoute(route.txs)
+    // The swap credits the output in the same transaction; a couple of quick
+    // freshest reads cover the case where a node is a block behind.
+    let out = 0n
+    for (let i = 0; i < 4 && out <= 0n; i++) {
+      out = (await ftBalance(this.rpc, tokenOut, this.me, 'freshest')) - before
+      if (out <= 0n) await new Promise((r) => setTimeout(r, 300))
+    }
+    return { hash: lastHash(results), out: out > 0n ? out : route.estimatedOut }
+  }
+
+  /**
+   * nearly.trade buy with NEAR. NEAR-quoted pairs go straight through the DEX
+   * path; other quotes (NEARLY, RHEA, ZEC, a tokenized stock) are reached in
+   * two router hops: NEAR → quote → token, both on Rhea DCL.
+   */
+  async buyNearly(tokenId: string, nearAmount: bigint): Promise<BuyResult> {
+    const info = await nearlyInfo(tokenId)
+    if (!info || info.quoteIsNear) return this.buyDex(tokenId, nearAmount)
+    await this.assertSpendable(nearAmount)
+    const hop1 = await this.routerSwap('near', info.quote, nearAmount)
+    const hop2 = await this.routerSwap(info.quote, tokenId, hop1.out)
+    const meta = await ftMetadata(this.rpc, tokenId)
+    this.recordBuy(tokenId, { symbol: meta.symbol, decimals: meta.decimals, tokens: hop2.out, costNear: nearAmount, costJambo: 0n, source: 'manual' })
+    return { hash: hop2.hash, tokens: hop2.out, decimals: meta.decimals, costNear: nearAmount, jamboIn: 0n }
   }
 
   /** umbrapad: register, then `buy` with NEAR attached; priced with umbrapad's own curve formula. */
   async buyUmbra(tokenId: string, nearAmount: bigint): Promise<BuyResult> {
     const curve = await this.umbra.curve(tokenId)
-    if (!Umbra.pairedWithNear(curve)) throw new TradeError('this umbrapad coin is paired with a token, not NEAR — not supported')
     if (curve.graduated) throw new TradeError('this coin has graduated — it trades on Rhea now')
     await this.assertSpendable(nearAmount)
+    if (!Umbra.pairedWithNear(curve)) return this.buyUmbraStock(tokenId, curve, nearAmount)
     const quoted = Umbra.quoteBuy(curve, nearAmount)
     if (!quoted) throw new TradeError('that buy is too big for what is left on the curve')
     // The coin refuses unregistered buyers ("storage_deposit first").
@@ -597,6 +704,37 @@ export class Trader {
       if (tokens <= 0n) await new Promise((r) => setTimeout(r, 500))
     }
     if (tokens <= 0n) throw new TradeError('the buy went through but no tokens arrived — check the wallet', tx.transaction.hash)
+    const meta = await ftMetadata(this.rpc, tokenId)
+    this.recordBuy(tokenId, { symbol: meta.symbol, decimals: meta.decimals, tokens, costNear: nearAmount, costJambo: 0n, source: 'manual' })
+    return { hash: tx.transaction.hash, tokens, decimals: meta.decimals, costNear: nearAmount, jamboIn: 0n }
+  }
+
+  /**
+   * umbrapad coin quoted in a tokenized stock (e.g. AAPLon / NVDAon, which are
+   * `bnb-….omdep.near`): buy the stock token with NEAR via the router, then buy
+   * the coin on its curve by sending that stock token with ft_transfer_call.
+   * Best-effort message format — if the coin rejects it, the stock is refunded
+   * and left in the wallet (sell it back from the token panel).
+   */
+  private async buyUmbraStock(tokenId: string, curve: Awaited<ReturnType<Umbra['curve']>>, nearAmount: bigint): Promise<BuyResult> {
+    const quoteToken = curve.quote_token!
+    const hop1 = await this.routerSwap('near', quoteToken, nearAmount) // NEAR -> stock token
+    const quoted = Umbra.quoteBuy(curve, hop1.out)
+    if (!quoted) throw new TradeError(`bought the stock token but that buy is too big for what is left on the curve — the ${quoteToken.split('.')[0]} is now in your wallet`)
+    await this.signer.sendAll(await registrationTxs(this.rpc, [tokenId], this.me))
+    const before = await ftBalance(this.rpc, tokenId, this.me, 'freshest')
+    const tx = await this.signer.send(this.umbra.buyWithQuoteTx(tokenId, quoteToken, hop1.out, minusBps(quoted, this.store.state.settings.slippageBps)))
+    let tokens = 0n
+    for (let i = 0; i < 8 && tokens <= 0n; i++) {
+      tokens = (await ftBalance(this.rpc, tokenId, this.me, 'freshest')) - before
+      if (tokens <= 0n) await new Promise((r) => setTimeout(r, 500))
+    }
+    if (tokens <= 0n) {
+      throw new TradeError(
+        `umbrapad refunded the stock token (the buy message format wasn't accepted). Your NEAR bought ${quoteToken.split('.')[0]}, which is now in your wallet — paste that token to sell it back.`,
+        tx.transaction.hash,
+      )
+    }
     const meta = await ftMetadata(this.rpc, tokenId)
     this.recordBuy(tokenId, { symbol: meta.symbol, decimals: meta.decimals, tokens, costNear: nearAmount, costJambo: 0n, source: 'manual' })
     return { hash: tx.transaction.hash, tokens, decimals: meta.decimals, costNear: nearAmount, jamboIn: 0n }
@@ -688,9 +826,14 @@ export class Trader {
       trader: this.me,
     })
     if (!route) throw new TradeError('no route found for this token')
-    const before = await ftBalance(this.rpc, tokenId, this.me)
-    const results = await this.signer.sendAll(route.txs)
-    const tokens = (await ftBalance(this.rpc, tokenId, this.me)) - before
+    const before = await ftBalance(this.rpc, tokenId, this.me, 'freshest')
+    const results = await this.sendRoute(route.txs)
+    let tokens = 0n
+    for (let i = 0; i < 4 && tokens <= 0n; i++) {
+      tokens = (await ftBalance(this.rpc, tokenId, this.me, 'freshest')) - before
+      if (tokens <= 0n) await new Promise((r) => setTimeout(r, 300))
+    }
+    if (tokens <= 0n) tokens = route.estimatedOut
     const meta = await ftMetadata(this.rpc, tokenId)
     this.recordBuy(tokenId, { symbol: meta.symbol, decimals: meta.decimals, tokens, costNear: nearAmount, costJambo: 0n, source: 'manual' })
     return { hash: lastHash(results), tokens, decimals: meta.decimals, costNear: nearAmount, jamboIn: 0n }
@@ -714,9 +857,23 @@ export class Trader {
 
     if (venue === 'umbra') {
       const curve = await this.umbra.curve(tokenId)
-      if (!Umbra.pairedWithNear(curve)) throw new TradeError('this umbrapad coin is paired with a token, not NEAR — not supported')
       const quoted = Umbra.quoteSell(curve, amount)
       if (!quoted) throw new TradeError('umbrapad will not take a sell of that size')
+      if (!Umbra.pairedWithNear(curve)) {
+        // Stock-quoted coin: sell on the curve for the stock token, then route it back to NEAR.
+        const quoteToken = curve.quote_token!
+        const qBefore = await ftBalance(this.rpc, quoteToken, this.me, 'freshest')
+        await this.signer.send(this.umbra.sellTx(tokenId, amount, minusBps(quoted, slip)))
+        let quoteOut = 0n
+        for (let i = 0; i < 8 && quoteOut <= 0n; i++) {
+          quoteOut = (await ftBalance(this.rpc, quoteToken, this.me, 'freshest')) - qBefore
+          if (quoteOut <= 0n) await new Promise((r) => setTimeout(r, 500))
+        }
+        if (quoteOut <= 0n) throw new TradeError('the umbrapad sell did not pay out the stock token — check the wallet')
+        const back = await this.routerSwap(quoteToken, 'near', quoteOut)
+        this.recordSell(tokenId, { tokens: amount, proceedsNear: back.out, proceedsJambo: 0n })
+        return { hash: back.hash, tokens: amount, proceedsNear: back.out, jamboOut: 0n }
+      }
       const before = await this.nearBalance()
       const tx = await this.signer.send(this.umbra.sellTx(tokenId, amount, minusBps(quoted, slip)))
       const got = await this.nearReceived(before)
@@ -778,10 +935,22 @@ export class Trader {
       return { hash, tokens: swap.inputAmount, proceedsNear, jamboOut: swap.outputAmount }
     }
 
+    if (venue === 'nearly') {
+      const info = await nearlyInfo(tokenId)
+      if (info && !info.quoteIsNear) {
+        // Two hops back to NEAR: token → quote → NEAR, both on Rhea DCL.
+        const hop1 = await this.routerSwap(tokenId, info.quote, amount)
+        const hop2 = await this.routerSwap(info.quote, 'near', hop1.out)
+        this.recordSell(tokenId, { tokens: amount, proceedsNear: hop2.out, proceedsJambo: 0n })
+        return { hash: hop2.hash, tokens: amount, proceedsNear: hop2.out, jamboOut: 0n }
+      }
+      // NEAR-quoted: fall through to the single-hop router sell below.
+    }
+
     const route = await this.router.best({ tokenIn: tokenId, tokenOut: 'near', amountIn: amount, slippageBps: slip, trader: this.me })
     if (!route) throw new TradeError('no route to sell this token')
     const before = await this.nearBalance()
-    const results = await this.signer.sendAll(route.txs)
+    const results = await this.sendRoute(route.txs)
     const got = await this.nearReceived(before)
     const proceedsNear = got > 0n ? got : route.estimatedOut
     this.recordSell(tokenId, { tokens: amount, proceedsNear, proceedsJambo: 0n })

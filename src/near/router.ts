@@ -31,13 +31,17 @@ export interface RouteRequest {
 const toId = (t: string) => (t === 'near' || t.includes(':') ? t : `nep141:${t}`)
 
 export class Router {
-  constructor(private readonly baseUrl: string) {}
+  constructor(
+    private readonly baseUrl: string,
+    /** How long the aggregator waits for DEX quotes. Lower = snappier trades. */
+    private readonly maxWaitMs = 700,
+  ) {}
 
   async routes(req: RouteRequest): Promise<Route[]> {
     const params = new URLSearchParams({
       token_in: toId(req.tokenIn),
       token_out: toId(req.tokenOut),
-      max_wait_ms: '1500',
+      max_wait_ms: String(this.maxWaitMs),
       slippage_type: 'Fixed',
       slippage: String(req.slippageBps / 10_000),
       trader_account_id: req.trader,

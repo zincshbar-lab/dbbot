@@ -1,6 +1,6 @@
 import { transactions } from 'near-api-js'
 import type { NearRpc } from '../near/rpc.js'
-import { TGAS } from '../near/tokens.js'
+import { TGAS, ftTransferCall } from '../near/tokens.js'
 import type { PlannedTx } from '../near/signer.js'
 
 /**
@@ -95,6 +95,16 @@ export class Umbra {
       receiverId: tokenId,
       actions: [transactions.functionCall('buy', Buffer.from(JSON.stringify({ min_out: minOut.toString() })), 100n * TGAS, nearIn)],
     }
+  }
+
+  /**
+   * Token-paired buy (e.g. a coin quoted in a tokenized stock): send the quote
+   * token to the coin with ft_transfer_call. Best-effort message format — the
+   * coin's ft_on_transfer refunds the tokens if it doesn't accept it, so a
+   * wrong guess costs gas, not the deposit.
+   */
+  buyWithQuoteTx(tokenId: string, quoteToken: string, quoteAmount: bigint, minOut: bigint): PlannedTx {
+    return { receiverId: quoteToken, actions: [ftTransferCall(tokenId, quoteAmount, JSON.stringify({ min_out: minOut.toString() }))] }
   }
 
   sellTx(tokenId: string, amount: bigint, minOut: bigint): PlannedTx {

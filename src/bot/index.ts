@@ -9,6 +9,7 @@ import { newWallet, verifyControls } from '../near/keys.js'
 import { NearRpc } from '../near/rpc.js'
 import { Chipfi, isChipfiToken } from '../chipfi/contract.js'
 import { Umbra, isUmbraToken } from '../umbra/contract.js'
+import { nearlyInfo, type NearlyInfo } from '../nearly/contract.js'
 import { parseMemeRef, shareOfExisting } from '../memecooking/contract.js'
 import { encrypt } from '../lib/crypto.js'
 import { ONE_NEAR, formatCompact, formatNear, formatUnits, mulDiv, parseUnits, pct } from '../lib/amounts.js'
@@ -391,8 +392,16 @@ export function createBot(d: Deps): Bot {
     }
     if (v.venue === 'umbra' || (isUmbraToken(tokenId) && v.venue === 'dex')) {
       const c = await trader.umbra.curve(tokenId)
-      venueLine = `umbrapad · ${c.graduated ? 'graduated · trading on Rhea' : `bonding curve ${Umbra.progress(c).toFixed(1)}% sold`} · fee ${c.fee_bps / 100}%` + (Umbra.pairedWithNear(c) ? '' : `\n⚠️ paired with a token — not supported`)
+      venueLine =
+        `umbrapad · ${c.graduated ? 'graduated · trading on Rhea' : `bonding curve ${Umbra.progress(c).toFixed(1)}% sold`} · fee ${c.fee_bps / 100}%` +
+        (Umbra.pairedWithNear(c) ? '' : `\n<i>paired with a tokenized stock (${esc((c.quote_token ?? '').split('.')[0] ?? '?')}) · bought/sold via NEAR ↔ stock ↔ coin</i>`)
       claimable = await trader.umbra.owed(tokenId)
+    }
+    let nearly: NearlyInfo | null = null
+    if (v.venue === 'nearly') {
+      nearly = await nearlyInfo(tokenId)
+      const q = nearly ? (nearly.quoteIsNear ? 'NEAR' : (nearly.quote.split('.')[0] ?? nearly.quote).toUpperCase()) : '?'
+      venueLine = `nearly.trade · paired with ${esc(q)} · Rhea DCL 1%` + (nearly && !nearly.quoteIsNear ? `\n<i>bought/sold via NEAR ↔ ${esc(q)} ↔ token</i>` : '')
     }
 
     // ---- market data ----
@@ -402,7 +411,13 @@ export function createBot(d: Deps): Bot {
       trader.supply(tokenId, v.meta.decimals).catch(() => 0),
     ])
     const mcNear = price !== null && supply ? price * supply : null
-    const liqNear = v.venue === 'curve' && v.state ? await trader.jamboInNear(BigInt(v.state.wnear_hold)).catch(() => null) : null
+    const liqNear =
+      v.venue === 'curve' && v.state
+        ? await trader.jamboInNear(BigInt(v.state.wnear_hold)).catch(() => null)
+        : nearly && nearly.liquidityNear > 0
+          ? BigInt(Math.round(nearly.liquidityNear * 1e24))
+          : null
+    const liqLabel = v.venue === 'curve' ? ' (curve reserve)' : v.venue === 'nearly' ? ' (pool)' : ''
 
     // ---- position block (entry MC → exit/now MC) ----
     let posBlock = ''
@@ -425,6 +440,7 @@ export function createBot(d: Deps): Bot {
     // ---- links ----
     const links =
       `\n\n🔗 <a href="https://nearblocks.io/address/${encodeURIComponent(tokenId)}">Contract</a>` +
+      (v.venue === 'nearly' ? ` · <a href="https://nearly.trade/${encodeURIComponent(tokenId)}">nearly.trade</a>` : '') +
       (v.venue === 'dex' || v.state?.is_deployed ? ` · <a href="https://dexscreener.com/near/${encodeURIComponent(tokenId)}">Chart</a>` : '') +
       (claimable ? `\n💰 Claimable: <b>${formatNear(claimable, 4)} NEAR</b>` : '')
 
@@ -433,7 +449,7 @@ export function createBot(d: Deps): Bot {
       `Market cap: <b>${mcNear === null ? '?' : nu ? `${usd(mcNear * nu)} (${nearCompact(mcNear)})` : nearCompact(mcNear)}</b>\n` +
       `Price:      ${price === null ? '?' : nu ? usd(price * nu) : `${price.toPrecision(3)} N`}\n` +
       `Supply:     ${supply ? formatCompact(BigInt(Math.round(supply)) * 10n ** BigInt(v.meta.decimals), v.meta.decimals) : '?'}\n` +
-      (liqNear !== null ? `Liquidity:  ~${formatNear(liqNear, 2)} N (curve reserve)\n` : '') +
+      (liqNear !== null ? `Liquidity:  ~${formatNear(liqNear, 2)} N${liqLabel}\n` : '') +
       posBlock +
       links
 
