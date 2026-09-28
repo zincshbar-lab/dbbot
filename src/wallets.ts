@@ -106,4 +106,15 @@ export class WalletManager {
     this.cache.get(id)?.session.stop()
     this.cache.delete(id)
   }
+
+  /** Write out any pending per-user state (positions) — call on shutdown. */
+  flushAll(): void {
+    for (const { session } of this.cache.values()) {
+      try {
+        session.store.flush()
+      } catch {
+        /* best effort */
+      }
+    }
+  }
 }

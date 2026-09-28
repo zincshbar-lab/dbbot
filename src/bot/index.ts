@@ -46,6 +46,20 @@ export function createBot(d: Deps): Bot {
   const awaiting = new Map<number, Awaiting>()
   const busy = new Set<string>()
 
+  // Telegram rate-limits a busy bot with 429 "retry after N". Without handling
+  // it, replies are dropped and the bot looks "down". This transformer waits
+  // the requested delay and retries, transparently, so sends still land.
+  bot.api.config.use(async (prev, method, payload, signal) => {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const res = await prev(method, payload, signal)
+      const r = res as { ok: boolean; error_code?: number; parameters?: { retry_after?: number } }
+      if (r.ok || r.error_code !== 429) return res
+      const wait = (r.parameters?.retry_after ?? 1) + 1
+      await new Promise((s) => setTimeout(s, wait * 1000))
+    }
+    return prev(method, payload, signal)
+  })
+
   const isAdmin = (id?: number) => id !== undefined && d.admins.includes(id)
   const hasAccess = (id?: number) => id !== undefined && (isAdmin(id) || accounts.isAllowed(id))
 

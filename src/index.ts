@@ -25,6 +25,7 @@ async function main() {
 
   const stop = (sig: string) => {
     log.info(`${sig} — stopping`)
+    wallets.flushAll() // persist any pending position updates before exit
     bot.stop()
   }
   process.once('SIGINT', () => stop('SIGINT'))

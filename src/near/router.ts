@@ -34,7 +34,7 @@ export class Router {
   constructor(
     private readonly baseUrl: string,
     /** How long the aggregator waits for DEX quotes. Lower = snappier trades. */
-    private readonly maxWaitMs = 700,
+    private readonly maxWaitMs = 500,
   ) {}
 
   async routes(req: RouteRequest): Promise<Route[]> {
