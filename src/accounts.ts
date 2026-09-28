@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { log } from './lib/log.js'
 
@@ -38,7 +38,12 @@ export class Accounts {
   private readonly file: string
 
   constructor(dataDir: string) {
-    mkdirSync(dataDir, { recursive: true })
+    mkdirSync(dataDir, { recursive: true, mode: 0o700 })
+    try {
+      chmodSync(dataDir, 0o700) // tighten even if the dir already existed
+    } catch {
+      /* best effort (e.g. non-POSIX FS) */
+    }
     this.file = join(dataDir, 'accounts.json')
     try {
       const raw = JSON.parse(readFileSync(this.file, 'utf8')) as Partial<Data>
@@ -51,8 +56,9 @@ export class Accounts {
   private save(): void {
     const tmp = `${this.file}.tmp`
     try {
-      writeFileSync(tmp, JSON.stringify(this.data, null, 2))
+      writeFileSync(tmp, JSON.stringify(this.data, null, 2), { mode: 0o600 }) // owner-only
       renameSync(tmp, this.file) // atomic swap
+      chmodSync(this.file, 0o600)
     } catch (err) {
       log.error('failed to save accounts', err)
     }

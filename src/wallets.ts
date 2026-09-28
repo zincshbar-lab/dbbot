@@ -42,9 +42,18 @@ export class UserSession {
   }
 }
 
-/** Builds and caches a UserSession per Telegram id from that user's stored key. */
+/**
+ * Builds and caches a UserSession per Telegram id from that user's stored key.
+ *
+ * Decrypted keys live only inside a cached session; idle sessions are evicted
+ * after IDLE_MS so a key isn't held in memory longer than it's being used
+ * (it's re-decrypted from disk on the next action). This shrinks the window in
+ * which a memory dump could expose a key.
+ */
 export class WalletManager {
-  private readonly cache = new Map<number, UserSession>()
+  private readonly cache = new Map<number, { session: UserSession; lastUsed: number }>()
+  /** Evict a session that hasn't been used in this long. */
+  static readonly IDLE_MS = 10 * 60_000
 
   constructor(
     private readonly rpc: NearRpc,
@@ -52,7 +61,20 @@ export class WalletManager {
     private readonly accounts: Accounts,
     private readonly encryptionSecret: string,
     private readonly dataDir: string,
-  ) {}
+  ) {
+    const sweep = setInterval(() => this.evictIdle(), 60_000)
+    sweep.unref()
+  }
+
+  private evictIdle(): void {
+    const cutoff = Date.now() - WalletManager.IDLE_MS
+    for (const [id, entry] of this.cache) {
+      if (entry.lastUsed < cutoff) {
+        entry.session.stop()
+        this.cache.delete(id)
+      }
+    }
+  }
 
   /** True if the user has a wallet imported/created. */
   has(id: number): boolean {
@@ -62,7 +84,10 @@ export class WalletManager {
   /** The user's session, or null if they have no wallet yet. */
   get(id: number): UserSession | null {
     const cached = this.cache.get(id)
-    if (cached) return cached
+    if (cached) {
+      cached.lastUsed = Date.now()
+      return cached.session
+    }
     const rec = this.accounts.getKey(id)
     if (!rec) return null
 
@@ -72,13 +97,13 @@ export class WalletManager {
     const store = new Store(join(this.dataDir, 'users', String(id)))
     const trader = new Trader(this.rpc, signer, this.router, gaypad, store)
     const session = new UserSession(trader, store, rec.accountId, signer)
-    this.cache.set(id, session)
+    this.cache.set(id, { session, lastUsed: Date.now() })
     return session
   }
 
   /** Drop the cached session (after the user changes or removes their wallet). */
   forget(id: number): void {
-    this.cache.get(id)?.stop()
+    this.cache.get(id)?.session.stop()
     this.cache.delete(id)
   }
 }

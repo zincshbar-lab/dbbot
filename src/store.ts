@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 /**
@@ -57,7 +57,7 @@ export class Store {
   private saveTimer: NodeJS.Timeout | null = null
 
   constructor(dir: string) {
-    mkdirSync(dir, { recursive: true })
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
     this.file = join(dir, 'state.json')
     this.state = this.load()
   }
@@ -91,8 +91,13 @@ export class Store {
 
   flush(): void {
     const tmp = `${this.file}.tmp`
-    writeFileSync(tmp, JSON.stringify(this.state, null, 2))
+    writeFileSync(tmp, JSON.stringify(this.state, null, 2), { mode: 0o600 })
     renameSync(tmp, this.file)
+    try {
+      chmodSync(this.file, 0o600)
+    } catch {
+      /* best effort */
+    }
   }
 
   recordBuy(
