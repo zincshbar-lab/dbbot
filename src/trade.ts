@@ -6,7 +6,7 @@ import { Gaypad, JAMBO, isGaypadToken, type SwapState } from './gaypad/contract.
 import { Shards, WRAP, isShardsToken } from './shards/contract.js'
 import { CHIPFI_STORAGE, Chipfi, isChipfiToken } from './chipfi/contract.js'
 import { Umbra, isUmbraToken } from './umbra/contract.js'
-import { isNearlyToken, nearlyInfo } from './nearly/contract.js'
+import { isNearlyToken, nearlyInfo, resolveNearlyPair } from './nearly/contract.js'
 import { MemeCooking } from './memecooking/contract.js'
 import { ftBalance, ftMetadata, registrationTxs, type FtMetadata } from './near/tokens.js'
 import { ONE_NEAR, applyBps, formatNear, minusBps, mulDiv } from './lib/amounts.js'
@@ -313,7 +313,14 @@ export class Trader {
   }
 
   async nearBalance(): Promise<bigint> {
-    return (await this.rpc.nativeBalance(this.me)).amount
+    // A created wallet doesn't exist on chain until it's funded — treat that as 0
+    // so the wallet/positions panels render instead of erroring out.
+    try {
+      return (await this.rpc.nativeBalance(this.me)).amount
+    } catch (err) {
+      if (/UNKNOWN_ACCOUNT|does not exist/i.test(String((err as Error)?.message ?? err))) return 0n
+      throw err
+    }
   }
 
   async venueOf(tokenId: string): Promise<{ venue: Venue; state: SwapState | null }> {
@@ -373,17 +380,18 @@ export class Trader {
         return spot?.amountOut ? this.jamboInNear(mulDiv(amount, probe, spot.amountOut)) : null
       }
       if (venue === 'nearly') {
-        const info = await nearlyInfo(tokenId)
-        if (info && !info.quoteIsNear) {
+        const pair = await resolveNearlyPair(this.rpc, tokenId)
+        if (pair && !pair.quoteIsNear) {
           // Two hops: token → quote → NEAR, estimated only (no transaction).
-          const r1 = await this.router.best({ tokenIn: tokenId, tokenOut: info.quote, amountIn: amount, slippageBps: 100, trader: this.me })
+          const r1 = await this.router.best({ tokenIn: tokenId, tokenOut: pair.quote, amountIn: amount, slippageBps: 100, trader: this.me })
           if (r1?.estimatedOut) {
-            const r2 = await this.router.best({ tokenIn: info.quote, tokenOut: 'near', amountIn: r1.estimatedOut, slippageBps: 100, trader: this.me })
+            const r2 = await this.router.best({ tokenIn: pair.quote, tokenOut: 'near', amountIn: r1.estimatedOut, slippageBps: 100, trader: this.me })
             if (r2) return r2.estimatedOut
           }
           // Fall back to nearly.trade's own price.
+          const info = await nearlyInfo(tokenId)
           const meta = await ftMetadata(this.rpc, tokenId)
-          return info.priceNear > 0 ? BigInt(Math.round(info.priceNear * (Number(amount) / 10 ** meta.decimals) * 1e24)) : null
+          return info && info.priceNear > 0 ? BigInt(Math.round(info.priceNear * (Number(amount) / 10 ** meta.decimals) * 1e24)) : null
         }
         // NEAR-quoted: a single router hop.
       }
@@ -675,11 +683,12 @@ export class Trader {
    * two router hops: NEAR → quote → token, both on Rhea DCL.
    */
   async buyNearly(tokenId: string, nearAmount: bigint): Promise<BuyResult> {
-    const info = await nearlyInfo(tokenId)
-    if (!info || info.quoteIsNear) return this.buyDex(tokenId, nearAmount)
+    const pair = await resolveNearlyPair(this.rpc, tokenId)
+    if (!pair) throw new TradeError("couldn't find a Rhea pool for this token — check the contract id")
+    if (pair.quoteIsNear) return this.buyDex(tokenId, nearAmount)
     await this.assertSpendable(nearAmount)
-    const hop1 = await this.routerSwap('near', info.quote, nearAmount)
-    const hop2 = await this.routerSwap(info.quote, tokenId, hop1.out)
+    const hop1 = await this.routerSwap('near', pair.quote, nearAmount)
+    const hop2 = await this.routerSwap(pair.quote, tokenId, hop1.out)
     const meta = await ftMetadata(this.rpc, tokenId)
     this.recordBuy(tokenId, { symbol: meta.symbol, decimals: meta.decimals, tokens: hop2.out, costNear: nearAmount, costJambo: 0n, source: 'manual' })
     return { hash: hop2.hash, tokens: hop2.out, decimals: meta.decimals, costNear: nearAmount, jamboIn: 0n }
@@ -936,11 +945,12 @@ export class Trader {
     }
 
     if (venue === 'nearly') {
-      const info = await nearlyInfo(tokenId)
-      if (info && !info.quoteIsNear) {
+      const pair = await resolveNearlyPair(this.rpc, tokenId)
+      if (!pair) throw new TradeError("couldn't find a Rhea pool for this token — check the contract id")
+      if (!pair.quoteIsNear) {
         // Two hops back to NEAR: token → quote → NEAR, both on Rhea DCL.
-        const hop1 = await this.routerSwap(tokenId, info.quote, amount)
-        const hop2 = await this.routerSwap(info.quote, 'near', hop1.out)
+        const hop1 = await this.routerSwap(tokenId, pair.quote, amount)
+        const hop2 = await this.routerSwap(pair.quote, 'near', hop1.out)
         this.recordSell(tokenId, { tokens: amount, proceedsNear: hop2.out, proceedsJambo: 0n })
         return { hash: hop2.hash, tokens: amount, proceedsNear: hop2.out, jamboOut: 0n }
       }
@@ -948,7 +958,12 @@ export class Trader {
     }
 
     const route = await this.router.best({ tokenIn: tokenId, tokenOut: 'near', amountIn: amount, slippageBps: slip, trader: this.me })
-    if (!route) throw new TradeError('no route to sell this token')
+    if (!route) {
+      const hint = tokenId.endsWith('.meme-cooking.near')
+        ? ' — this meme.cooking presale may not have launched (or it failed), so there is no pool to sell into'
+        : ' — it has no liquidity pool the router can reach right now'
+      throw new TradeError(`couldn't find a market to sell this token${hint}`)
+    }
     const before = await this.nearBalance()
     const results = await this.sendRoute(route.txs)
     const got = await this.nearReceived(before)

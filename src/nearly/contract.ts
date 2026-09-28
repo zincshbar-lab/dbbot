@@ -14,10 +14,59 @@
  * trading is done through the router in trade.ts.
  */
 
+import type { NearRpc } from '../near/rpc.js'
+
 const WRAP = 'wrap.near'
 const API = 'https://nearly.trade/api'
+/** Rhea DCL (Ref DCL v2) — where every nearly.trade pool lives. */
+const DCL = 'dclv2.ref-labs.near'
+/** nearly.trade pools are all the 1% fee tier. */
+const FEE = '10000'
+const NEARLY_TOKEN = 'nearly-993927.nearlytrade.near'
+/** Quote assets nearly.trade pairs against, most common first. */
+const CANDIDATE_QUOTES = [WRAP, NEARLY_TOKEN, 'token.rhealab.near', 'zec.omft.near']
 
 export const isNearlyToken = (id: string) => /\.nearlytrade\.near$/.test(id.trim().toLowerCase())
+
+export interface NearlyPair {
+  quote: string
+  poolId: string
+  quoteIsNear: boolean
+}
+
+const pairCache = new Map<string, { at: number; pair: NearlyPair | null }>()
+
+/**
+ * The token's Rhea DCL pool and quote asset, resolved from chain (with the
+ * nearly.trade API as a fast first source). Independent of the API's paging, so
+ * it works for every launched token — which is what makes selling reliable.
+ */
+export async function resolveNearlyPair(rpc: NearRpc, token: string): Promise<NearlyPair | null> {
+  const key = token.trim().toLowerCase()
+  const hit = pairCache.get(key)
+  if (hit && Date.now() - hit.at < 300_000) return hit.pair
+
+  let pair: NearlyPair | null = null
+  const info = await nearlyInfo(key)
+  if (info?.poolId) {
+    pair = { quote: info.quote, poolId: info.poolId, quoteIsNear: info.quoteIsNear }
+  } else {
+    // Probe the DCL contract for the token's pool against each candidate quote.
+    const probes = CANDIDATE_QUOTES.flatMap((q) => [
+      { q, pid: `${key}|${q}|${FEE}` },
+      { q, pid: `${q}|${key}|${FEE}` },
+    ])
+    const found = await Promise.all(
+      probes.map(async ({ q, pid }) => {
+        const p = await rpc.view<{ pool_id?: string } | null>(DCL, 'get_pool', { pool_id: pid }).catch(() => null)
+        return p?.pool_id ? { quote: q, poolId: pid, quoteIsNear: q === WRAP } : null
+      }),
+    )
+    pair = found.find((x): x is NearlyPair => x !== null) ?? null
+  }
+  pairCache.set(key, { at: Date.now(), pair })
+  return pair
+}
 
 export interface NearlyInfo {
   token: string
