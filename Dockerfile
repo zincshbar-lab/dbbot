@@ -9,5 +9,4 @@ COPY src ./src
 RUN npm install --no-save typescript && npx tsc -p tsconfig.json && npm prune --omit=dev
 
 ENV DATA_DIR=/data
-VOLUME ["/data"]
 CMD ["node", "dist/index.js"]
